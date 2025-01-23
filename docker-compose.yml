@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: . # Build from the current directory
+    environment:
+      - RUST_LOG=info
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --watch container-1 --restart container-2 --pattern hello_world
