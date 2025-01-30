@@ -1,12 +1,17 @@
-version: '3.8'
-
 services:
-  app:
-    build:
-      context: . # Build from the current directory
-    environment:
-      - RUST_LOG=info
-    restart: always
+  # app:
+  #   build:
+  #     context: . # Build the Rust restarter service from the current directory
+  #   environment:
+  #     - RUST_LOG=info
+  #   restart: always
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock # Access Docker socket for control
+  #   command: --watch logger --restart logger --pattern hello_world --count 2
+
+  logger:
+    image: bash # Uses a lightweight bash image
+    container_name: logger
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --watch container-1 --restart container-2 --pattern hello_world
+      - ./script.sh:/script.sh
+    entrypoint: [ "/bin/sh", "/script.sh" ]

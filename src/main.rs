@@ -4,10 +4,11 @@ use bollard::Docker;
 use clap::Parser;
 use futures_util::StreamExt;
 use log::{debug, error, info};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::future::IntoFuture;
 use std::process::exit;
-use std::sync::Arc;
-use tokio::sync::Notify;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 
 #[derive(Parser, Debug)]
@@ -27,6 +28,10 @@ struct Args {
     /// Patterns to watch for (comma-separated)
     #[arg(long, short, value_name = "PATTERN", required = true, action = clap::ArgAction::Append)]
     pattern: Vec<String>,
+
+    /// Number of occurrences before a restart is triggered
+    #[arg(long, short, value_name = "count", required = true, action = clap::ArgAction::Append)]
+    count: Vec<String>,
 }
 
 #[tokio::main]
@@ -37,8 +42,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     debug!("Raw clap args: {args:?}");
 
-    if args.watch.len() != args.restart.len() || (args.watch.len() != args.pattern.len()) {
-        panic!("Invalid args. Expected format: '--watch <container> --restart [container] --pattern [pattern]'")
+    let watch_count = args.watch.len();
+
+    if (watch_count != args.restart.len())
+        || (watch_count != args.pattern.len())
+        || (watch_count != args.count.len())
+    {
+        panic!("Invalid args. Expected format: '--watch <container> --restart [container] --pattern [pattern] --count [count]'.\nThe number of --watch, --restart, --pattern and --count should be symmetrical.")
     }
 
     let configs: Vec<ContainerRestartConfig> = args
@@ -46,14 +56,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .zip(args.restart.iter())
         .zip(args.pattern.iter())
-        .map(|((watch, restart_raw), pattern_raw)| {
+        .zip(args.count.iter())
+        .map(|(((watch, restart_raw), pattern_raw), count)| {
             let restart: Vec<String> = restart_raw.split(',').map(|s| s.to_string()).collect();
-            let pattern: Vec<String> = pattern_raw.split(',').map(|s| s.to_string()).collect();
+            let count: u16 = count
+                .parse()
+                .expect("Not a valid number provided to --count");
 
             ContainerRestartConfig {
                 watch: watch.to_string(),
                 restart,
-                pattern,
+                pattern: pattern_raw.to_string(),
+                count,
             }
         })
         .collect();
@@ -70,8 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Connected to Docker. Beginning to monitor logs...");
 
-    let mut tasks = HashMap::new();
-    let notify_restart = Arc::new(Notify::new());
+    let mut tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut containers: HashMap<String, MappedContainer> = HashMap::new();
 
     loop {
         let containers_names: Vec<_> = configs.iter().map(|c| c.watch.clone()).collect();
@@ -86,17 +100,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .find(|config| config.watch == container.name)
                             .unwrap();
 
-                        MappedContainer {
-                            id: container.id.clone(),
-                            name: container.name.clone(),
-                            restart: config.restart.clone(),
-                            pattern: config.pattern.clone(),
-                        }
+                        (
+                            container.id.clone(),
+                            MappedContainer {
+                                id: container.id.clone(),
+                                name: container.name.clone(),
+                                restart: config.restart.clone(),
+                                pattern: config.pattern.clone(),
+                                count: config.count,
+                            },
+                        )
                     })
-                    .collect::<Vec<MappedContainer>>())
+                    .collect::<HashMap<String, MappedContainer>>())
             });
 
-        let containers = match containers_result {
+        let new_containers = match containers_result {
             Ok(cons) => cons,
             Err(err) => {
                 error!("Failed to get containers: {}", err);
@@ -107,20 +125,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        for container in &containers {
+        for id in containers.keys() {
+            if !new_containers.contains_key(id) {
+                if let Some(task) = tasks.remove(id) {
+                    task.abort();
+                }
+            }
+        }
+
+        containers = new_containers;
+
+        for container in containers.values() {
             if !tasks.contains_key(&container.id) {
                 let task_container = container.clone();
                 let container_id = container.id.clone();
                 let container_name = container.name.clone();
                 let docker_clone = docker.clone();
-                let notify_restart_clone = notify_restart.clone();
 
-                info!("[{container_name}] Monitoring logs w/ id: {container_id}");
+                info!("[{container_name}] Monitoring logs...");
 
                 let task_handle = tokio::spawn(async move {
-                    if let Err(e) =
-                        monitor_logs(&docker_clone, &task_container, notify_restart_clone).await
-                    {
+                    if let Err(e) = monitor_logs(&docker_clone, &task_container).await {
                         error!("[{container_name}] Error monitoring logs for {container_id}: {e}");
                     }
                 });
@@ -129,25 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Remove tasks for containers no longer running
-        let current_containers: HashSet<_> = containers.iter().map(|c| c.id.clone()).collect();
-        let stale_containers: Vec<_> = tasks
-            .keys()
-            .filter(|id| !current_containers.contains(*id))
-            .cloned()
-            .collect();
-
-        for stale_id in stale_containers {
-            if let Some(task) = tasks.remove(&stale_id) {
-                task.abort();
-            }
-        }
-
-        // Wait for notifications about restarts or a periodic delay
-        tokio::select! {
-            _ = notify_restart.notified() => {}
-            _ = sleep(Duration::from_secs(10)) => {}
-        }
+        sleep(Duration::from_secs(10)).into_future().await
     }
 }
 
@@ -162,7 +169,8 @@ struct Container {
 struct ContainerRestartConfig {
     watch: String,
     restart: Vec<String>,
-    pattern: Vec<String>,
+    pattern: String,
+    count: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +178,8 @@ struct MappedContainer {
     id: String,
     name: String,
     restart: Vec<String>,
-    pattern: Vec<String>,
+    pattern: String,
+    count: u16,
 }
 
 async fn get_running_containers(
@@ -200,15 +209,17 @@ async fn get_filtered_containers(
 
     let filtered_containers = containers
         .into_iter()
-        .filter_map(|c| match (c.names, c.id) {
-            (Some(names), Some(id)) => {
-                let name = names[0].trim_start_matches("/").to_string();
-                match container_names.contains(&name) {
-                    true => Some(Container { id, name }),
-                    false => None,
+        .filter_map(|c| {
+            return match (c.names, c.id) {
+                (Some(names), Some(id)) => {
+                    let name = names[0].trim_start_matches("/").to_string();
+                    match container_names.contains(&name) {
+                        true => Some(Container { id, name }),
+                        false => None,
+                    }
                 }
-            }
-            _ => None,
+                _ => None,
+            };
         })
         .collect();
 
@@ -220,46 +231,62 @@ async fn get_filtered_containers(
 async fn monitor_logs(
     docker: &Docker,
     container: &MappedContainer,
-    notify_restart: Arc<Notify>,
+    // restart_tx: Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let container_id = &container.id;
-    let container_name = &container.name;
-    let mut log_stream = docker.logs(
-        &container.id,
-        Some(LogsOptions::<String> {
-            stdout: true,
-            stderr: true,
-            follow: true,
-            ..Default::default()
-        }),
-    );
+    let MappedContainer {
+        id,
+        name,
+        pattern,
+        count,
+        ..
+    } = container;
+    let mut occurrences = 0;
+    let mut since = now() - 10;
+    let mut log_stream;
 
-    while let Some(log_result) = log_stream.next().await {
-        match log_result {
-            Ok(log) => {
-                let log_output = log.to_string();
-                debug!("[{container_name} - {container_id}] LOG: {log_output}");
+    loop {
+        log_stream = docker.logs(
+            id,
+            Some(LogsOptions::<String> {
+                stdout: true,
+                stderr: true,
+                follow: true,
+                since,
+                ..Default::default()
+            }),
+        );
 
-                for pattern in &container.pattern {
+        while let Some(log_result) = log_stream.next().await {
+            match log_result {
+                Ok(log) => {
+                    let log_output = log.to_string();
+                    debug!("[{name}] New line: '{log_output}'");
+
                     if log_output.contains(pattern) {
-                        info!("[{container_name}] RESTARTING: '{pattern}' detected in '{log_output}'.");
-                        restart_container(docker, container).await?;
-                        notify_restart.notify_waiters(); // Notify the main loop about the restart
-                        return Ok(());
+                        occurrences += 1;
+                        info!("[{name}] Pattern detected ({occurrences}/{count}): '{pattern}' -> '{log_output}'");
+                        if *count <= occurrences {
+                            occurrences = 0;
+
+                            info!("[{name}] Restarting container: '{pattern}' detected in '{log_output}'");
+                            restart_containers(docker, container).await?;
+                            info!("[{name}] Successfully restarted container");
+
+                            since = now();
+                            break;
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                error!("[{container_name}] Failed to read logs: {e}");
-                break;
+                Err(e) => {
+                    error!("[{name}] Failed to read logs: {e}");
+                    break;
+                }
             }
         }
     }
-
-    Ok(())
 }
 
-async fn restart_container(
+async fn restart_containers(
     docker: &Docker,
     container: &MappedContainer,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -269,6 +296,12 @@ async fn restart_container(
             .restart_container(&container.id, None::<RestartContainerOptions>)
             .await?;
     }
-    info!("[{}] Successfully restarted container", container.name);
     Ok(())
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs() as i64
 }
