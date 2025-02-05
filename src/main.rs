@@ -30,8 +30,8 @@ struct Args {
     pattern: Vec<String>,
 
     /// Number of occurrences before a restart is triggered
-    #[arg(long, short, value_name = "count", required = true, action = clap::ArgAction::Append)]
-    count: Vec<String>,
+    #[arg(long = "skip-first", short, value_name = "BOOLEAN", required = true, action = clap::ArgAction::Append)]
+    skip_first: Vec<bool>,
 }
 
 #[tokio::main]
@@ -46,9 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if (watch_count != args.restart.len())
         || (watch_count != args.pattern.len())
-        || (watch_count != args.count.len())
+        || (watch_count != args.skip_first.len())
     {
-        panic!("Invalid args. Expected format: '--watch <container> --restart [container] --pattern [pattern] --count [count]'.\nThe number of --watch, --restart, --pattern and --count should be symmetrical.")
+        panic!("Invalid args. Expected format: '--watch <container> --restart [container] --pattern [pattern] --skip-first [boolean]'.\nThe number of --watch, --restart, --pattern and --skip-first should be symmetrical.")
     }
 
     let configs: Vec<ContainerRestartConfig> = args
@@ -56,18 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .zip(args.restart.iter())
         .zip(args.pattern.iter())
-        .zip(args.count.iter())
-        .map(|(((watch, restart_raw), pattern_raw), count)| {
+        .zip(args.skip_first.iter())
+        .map(|(((watch, restart_raw), pattern), skip_first)| {
             let restart: Vec<String> = restart_raw.split(',').map(|s| s.to_string()).collect();
-            let count: u16 = count
-                .parse()
-                .expect("Not a valid number provided to --count");
 
             ContainerRestartConfig {
                 watch: watch.to_string(),
                 restart,
-                pattern: pattern_raw.to_string(),
-                count,
+                pattern: pattern.to_string(),
+                skip_first: *skip_first,
             }
         })
         .collect();
@@ -107,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 name: container.name.clone(),
                                 restart: config.restart.clone(),
                                 pattern: config.pattern.clone(),
-                                count: config.count,
+                                skip_first: config.skip_first,
                             },
                         )
                     })
@@ -170,7 +167,7 @@ struct ContainerRestartConfig {
     watch: String,
     restart: Vec<String>,
     pattern: String,
-    count: u16,
+    skip_first: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -179,7 +176,7 @@ struct MappedContainer {
     name: String,
     restart: Vec<String>,
     pattern: String,
-    count: u16,
+    skip_first: bool,
 }
 
 async fn get_running_containers(
@@ -237,10 +234,10 @@ async fn monitor_logs(
         id,
         name,
         pattern,
-        count,
+        skip_first,
         ..
     } = container;
-    let mut occurrences = 0;
+    let mut first_time = true;
     let mut since = now() - 10;
     let mut log_stream;
 
@@ -263,11 +260,8 @@ async fn monitor_logs(
                     debug!("[{name}] New line: '{log_output}'");
 
                     if log_output.contains(pattern) {
-                        occurrences += 1;
-                        info!("[{name}] Pattern detected ({occurrences}/{count}): '{pattern}' -> '{log_output}'");
-                        if *count <= occurrences {
-                            occurrences = 0;
-
+                        info!("[{name}] Pattern detected (first_time={first_time}): '{pattern}' -> '{log_output}'");
+                        if !skip_first || !first_time {
                             info!("[{name}] Restarting container: '{pattern}' detected in '{log_output}'");
                             restart_containers(docker, container).await?;
                             info!("[{name}] Successfully restarted container");
@@ -276,6 +270,7 @@ async fn monitor_logs(
                             break;
                         }
                     }
+                    first_time = false;
                 }
                 Err(e) => {
                     error!("[{name}] Failed to read logs: {e}");
